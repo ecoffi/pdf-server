@@ -366,11 +366,18 @@ READER_HTML = """
     .viewer { display: flex; justify-content: center; align-items: flex-start; padding: 8px; }
     img { max-width: 100%; height: auto; display: block; background: #222; }
     .controls { position: fixed; left: 0; right: 0; bottom: 0; display: flex; justify-content: space-between; gap: 8px; padding: 10px; background: rgba(17,17,17,.95); border-top: 1px solid #2a2a2a; }
-    .btn { flex: 1; text-align: center; padding: 14px 10px; background: #2a2a2a; border-radius: 12px; color: #fff; text-decoration: none; font-size: 18px; touch-action: manipulation; user-select: none; }
+    .btn { flex: 1; text-align: center; padding: 14px 10px; background: #2a2a2a; border-radius: 12px; color: #fff; text-decoration: none; font-size: 18px; touch-action: manipulation; user-select: none; border: none; cursor: pointer; }
     .btn:active { background: #444; }
     .spacer { height: 76px; }
+    .right-actions { display: flex; align-items: center; gap: 12px; }
     .pagejump { display:flex; gap:8px; align-items:center; }
     input[type=number] { width: 90px; font-size: 16px; padding: 8px; border-radius: 10px; border: 1px solid #444; background: #222; color: #fff; }
+    
+    /* Fullscreen Icon Styling */
+    .fullscreen-btn { display: flex; align-items: center; justify-content: center; padding: 10px; background: #2a2a2a; border-radius: 10px; color: #fff; border: none; cursor: pointer; }
+    .fullscreen-btn:active { background: #444; }
+    .fullscreen-btn svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+    .exit-icon { display: none; }
   </style>
 </head>
 <body>
@@ -379,9 +386,19 @@ READER_HTML = """
       <div><a href="{{ url_for('index') }}">← Library</a></div>
       <div class="meta">{{ title }} · Page <span id="pageLabel">{{ page }}</span>{% if page_count %} / {{ page_count }}{% endif %}</div>
     </div>
-    <div class="pagejump">
-      <input id="pageInput" type="number" min="1" max="{{ page_count or 999999 }}" value="{{ page }}">
-      <button class="btn" style="flex:none; padding:10px 12px; font-size:14px;" onclick="jumpToPage()">Go</button>
+    <div class="right-actions">
+      <button class="fullscreen-btn" onclick="toggleFullscreen()" title="Toggle Fullscreen">
+        <svg class="enter-icon" viewBox="0 0 24 24">
+          <path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/>
+        </svg>
+        <svg class="exit-icon" viewBox="0 0 24 24">
+          <path d="M4 14h6v6M20 10h-6V4M14 10l7-7M10 14l-7 7"/>
+        </svg>
+      </button>
+      <div class="pagejump">
+        <input id="pageInput" type="number" min="1" max="{{ page_count or 999999 }}" value="{{ page }}">
+        <button class="btn" style="flex:none; padding:10px 12px; font-size:14px;" onclick="jumpToPage()">Go</button>
+      </div>
     </div>
   </div>
 
@@ -400,6 +417,29 @@ READER_HTML = """
   const pdfId = "{{ pdf_id }}";
   let currentPage = {{ page }};
   const maxPage = {{ page_count or 999999 }};
+
+  function toggleFullscreen() {
+    if (!document.fullscreenElement) {
+      document.documentElement.requestFullscreen().catch((err) => {
+        console.error(`Error attempting to enable fullscreen: ${err.message}`);
+      });
+    } else {
+      document.exitFullscreen();
+    }
+  }
+
+  // Monitor fullscreen state changes to swap out the SVG paths automatically
+  document.addEventListener('fullscreenchange', () => {
+    const enterIcon = document.querySelector('.enter-icon');
+    const exitIcon = document.querySelector('.exit-icon');
+    if (document.fullscreenElement) {
+      enterIcon.style.display = 'none';
+      exitIcon.style.display = 'block';
+    } else {
+      enterIcon.style.display = 'block';
+      exitIcon.style.display = 'none';
+    }
+  });
 
   function saveProgress(page) {
     fetch(`/pdf/${pdfId}/progress`, {
