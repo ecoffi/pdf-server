@@ -114,21 +114,28 @@ def save_pdfs_state() -> None:
 
 
 def save_progress_state() -> None:
-    rows = []
+    # Read the full raw data to preserve other readers' historical progress logs during single-user updates
+    existing_rows = csv_read_dicts(PROGRESS_CSV)
+    
+    # Store everything keyed by (reader_id, pdf_id)
+    state_map = {}
+    for row in existing_rows:
+        state_map[(row["reader_id"], row["pdf_id"])] = row
+
+    # Overwrite/insert with fresh in-memory live tracking updates
     for rid, pdf_map in progress_by_reader.items():
         for pid, page in pdf_map.items():
-            rows.append(
-                {
-                    "reader_id": rid,
-                    "pdf_id": pid,
-                    "current_page": str(page),
-                    "last_read": str(int(time.time())),
-                }
-            )
+            state_map[(rid, pid)] = {
+                "reader_id": rid,
+                "pdf_id": pid,
+                "current_page": str(page),
+                "last_read": str(int(time.time())),
+            }
+            
     csv_write_dicts_atomic(
         PROGRESS_CSV,
         ["reader_id", "pdf_id", "current_page", "last_read"],
-        rows,
+        list(state_map.values()),
     )
 
 
@@ -271,6 +278,27 @@ def sorted_pdfs() -> List[dict]:
     )
 
 
+def get_recent_reads(reader_id: str, limit: int = 5) -> List[dict]:
+    """Retrieves up to `limit` entries the current reader has most recently opened."""
+    rows = csv_read_dicts(PROGRESS_CSV)
+    # Filter records targeting only this specific active cookie user
+    user_rows = [r for r in rows if r.get("reader_id") == reader_id]
+    
+    # Sort descending based on unix Epoch timestamp string values
+    user_rows.sort(key=lambda r: int(r.get("last_read", 0)), reverse=True)
+    
+    recent = []
+    for row in user_rows:
+        pid = row.get("pdf_id")
+        if pid in pdfs_by_id:  # Verify file index mapping presence (prevent dead links)
+            pdf_data = dict(pdfs_by_id[pid])
+            pdf_data["current_page"] = row.get("current_page", "1")
+            recent.append(pdf_data)
+            if len(recent) >= limit:
+                break
+    return recent
+
+
 # ----------------------------
 # Startup
 # ----------------------------
@@ -312,9 +340,12 @@ INDEX_HTML = """
     body { font-family: system-ui, sans-serif; margin: 0; background: #f4f4f4; color: #111; }
     header { padding: 16px; background: #111; color: #fff; position: sticky; top: 0; }
     .wrap { max-width: 900px; margin: 0 auto; padding: 12px; }
-    .card { background: #fff; border-radius: 14px; padding: 14px; margin: 10px 0; box-shadow: 0 1px 4px rgba(0,0,0,.08); }
+    .section-title { font-size: 14px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; color: #666; margin: 24px 0 8px 4px; }
+    .card { background: #fff; border-radius: 14px; padding: 14px; margin: 10px 0; box-shadow: 0 1px 4px rgba(0,0,0,.08); border: 1px solid transparent; }
+    .card.accent { border-left: 4px solid #0066cc; border-radius: 10px 14px 14px 10px; }
     .title { font-size: 18px; font-weight: 700; margin-bottom: 4px; }
-    .meta { color: #555; font-size: 14px; }
+    .meta { color: #555; font-size: 14px; display: flex; gap: 8px; align-items: center; }
+    .badge { background: #e0f0ff; color: #0066cc; padding: 2px 6px; border-radius: 6px; font-size: 11px; font-weight: bold; }
     a { color: inherit; text-decoration: none; display: block; }
     .btn { display: inline-block; margin-top: 10px; background: #111; color: #fff; padding: 10px 12px; border-radius: 10px; }
     .topbar { display:flex; gap:10px; flex-wrap:wrap; align-items:center; justify-content:space-between; }
@@ -331,6 +362,26 @@ INDEX_HTML = """
     </div>
   </header>
   <div class="wrap">
+  
+    {# --- CONTINUE READING SECTION --- #}
+    {% if recents and not q %}
+      <div class="section-title">Continue Reading</div>
+      {% for pdf in recents %}
+        <div class="card accent">
+          <a href="{{ url_for('read_pdf', pdf_id=pdf['pdf_id']) }}">
+            <div class="title">{{ pdf['title'] }}</div>
+            <div class="meta">
+              <span class="badge">Page {{ pdf['current_page'] }}</span>
+              {% if pdf['folder'] %}{{ pdf['folder'] }} / {% endif %}
+              {% if pdf['page_count'] %}{{ pdf['page_count'] }} pages{% endif %}
+            </div>
+          </a>
+        </div>
+      {% endfor %}
+    {% endif %}
+
+    {# --- MAIN LIBRARY LIST SECTION --- #}
+    <div class="section-title">{% if q %}Search Results{% else %}All Documents{% endif %}</div>
     {% for pdf in pdfs %}
       <div class="card">
         <a href="{{ url_for('read_pdf', pdf_id=pdf['pdf_id']) }}">
@@ -342,9 +393,10 @@ INDEX_HTML = """
         </a>
       </div>
     {% else %}
-      <p>No PDFs found in <code>{{ library_dir }}</code>.</p>
+      <p>No PDFs found matching your query.</p>
     {% endfor %}
-    <div style="margin-top:16px;">
+    
+    <div style="margin-top:24px;">
       <a class="btn" href="{{ url_for('rescan') }}">Rescan library</a>
     </div>
   </div>
@@ -428,7 +480,6 @@ READER_HTML = """
     }
   }
 
-  // Monitor fullscreen state changes to swap out the SVG paths automatically
   document.addEventListener('fullscreenchange', () => {
     const enterIcon = document.querySelector('.enter-icon');
     const exitIcon = document.querySelector('.exit-icon');
@@ -490,6 +541,7 @@ READER_HTML = """
 
 @app.route("/")
 def index():
+    reader_id = get_reader_id()
     q = (request.args.get("q") or "").strip().lower()
     items = sorted_pdfs()
     if q:
@@ -497,9 +549,14 @@ def index():
             p for p in items
             if q in p.get("title", "").lower() or q in p.get("folder", "").lower() or q in p.get("path", "").lower()
         ]
+    
+    # Fetch recent reads only when not searching to keep layout clean
+    recents = get_recent_reads(reader_id, limit=5)
+    
     return render_template_string(
         INDEX_HTML,
         pdfs=items,
+        recents=recents,
         count=len(items),
         q=q,
         library_dir=str(LIBRARY_DIR),
@@ -525,7 +582,6 @@ def read_pdf(pdf_id: str):
         start_page = count
 
     base_url = url_for("pdf_page", pdf_id=pdf_id, page_num=1)
-    # We'll replace trailing 1 with the chosen page in JS/CSS-safe way
     base_url = base_url.rsplit("/", 1)[0] + "/"
 
     return render_template_string(
@@ -582,7 +638,7 @@ def pdf_page(pdf_id: str, page_num: int):
 
 @app.route("/pdf/<pdf_id>/progress", methods=["GET", "POST"])
 def progress(pdf_id: str):
-    get_pdf(pdf_id)  # validate exists
+    get_pdf(pdf_id)
     reader_id = get_reader_id()
 
     if request.method == "GET":
@@ -606,5 +662,4 @@ def rebuild_cache(pdf_id: str):
 
 
 if __name__ == "__main__":
-    # On a tablet-friendly LAN setup, use 0.0.0.0 so other devices can reach it.
     app.run(host="0.0.0.0", port=8000, debug=True)
