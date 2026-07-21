@@ -35,6 +35,7 @@ DATA_DIR = Path(os.environ.get("PDF_DATA_DIR", "./data")).resolve()
 CACHE_DIR = DATA_DIR / "cache"
 PDFS_CSV = DATA_DIR / "pdfs.csv"
 PROGRESS_CSV = DATA_DIR / "progress.csv"
+BOOKMARKS_CSV = DATA_DIR / "bookmarks.csv"
 
 JPEG_QUALITY = 80
 RENDER_ZOOM = 1.8  # Higher = sharper, larger files
@@ -48,6 +49,7 @@ render_locks: Dict[str, threading.Lock] = {}
 # In-memory indexes
 pdfs_by_id: Dict[str, dict] = {}
 progress_by_reader: Dict[str, Dict[str, int]] = {}
+bookmarks_by_reader: Dict[str, Dict[str, set[int]]] = {}
 
 
 # ----------------------------
@@ -62,6 +64,8 @@ def ensure_dirs() -> None:
         PDFS_CSV.write_text("pdf_id,path,title,folder,mtime,page_count\n", encoding="utf-8")
     if not PROGRESS_CSV.exists():
         PROGRESS_CSV.write_text("reader_id,pdf_id,current_page,last_read\n", encoding="utf-8")
+    if not BOOKMARKS_CSV.exists():
+        BOOKMARKS_CSV.write_text("reader_id,pdf_id,page,created_at\n", encoding="utf-8")
 
 
 def stable_pdf_id(path: Path) -> str:
@@ -89,7 +93,7 @@ def csv_write_dicts_atomic(path: Path, fieldnames: List[str], rows: List[dict]) 
 
 
 def load_state() -> None:
-    global pdfs_by_id, progress_by_reader
+    global pdfs_by_id, progress_by_reader, bookmarks_by_reader
 
     pdfs_by_id = {}
     for row in csv_read_dicts(PDFS_CSV):
@@ -101,6 +105,13 @@ def load_state() -> None:
         pid = row["pdf_id"]
         page = int(row["current_page"])
         progress_by_reader.setdefault(rid, {})[pid] = page
+
+    bookmarks_by_reader = {}
+    for row in csv_read_dicts(BOOKMARKS_CSV):
+        rid = row["reader_id"]
+        pid = row["pdf_id"]
+        page = int(row["page"])
+        bookmarks_by_reader.setdefault(rid, {}).setdefault(pid, set()).add(page)
 
 
 def save_pdfs_state() -> None:
@@ -136,6 +147,34 @@ def save_progress_state() -> None:
         PROGRESS_CSV,
         ["reader_id", "pdf_id", "current_page", "last_read"],
         list(state_map.values()),
+    )
+
+
+def save_bookmarks_state() -> None:
+    rows = []
+    existing_rows = csv_read_dicts(BOOKMARKS_CSV)
+    created_map = {
+        (row.get("reader_id"), row.get("pdf_id"), int(row.get("page", 0))): row.get("created_at", "")
+        for row in existing_rows
+        if row.get("reader_id") and row.get("pdf_id") and row.get("page")
+    }
+
+    for rid, pdf_map in bookmarks_by_reader.items():
+        for pid, pages in pdf_map.items():
+            for page in sorted(pages):
+                key = (rid, pid, page)
+                rows.append({
+                    "reader_id": rid,
+                    "pdf_id": pid,
+                    "page": str(page),
+                    "created_at": created_map.get(key) or str(int(time.time())),
+                })
+
+    rows.sort(key=lambda r: int(r.get("created_at", 0)), reverse=True)
+    csv_write_dicts_atomic(
+        BOOKMARKS_CSV,
+        ["reader_id", "pdf_id", "page", "created_at"],
+        rows,
     )
 
 
@@ -271,6 +310,36 @@ def set_progress(reader_id: str, pdf_id: str, page: int) -> None:
     save_progress_state()
 
 
+def is_bookmarked(reader_id: str, pdf_id: str, page: int) -> bool:
+    return int(page) in bookmarks_by_reader.get(reader_id, {}).get(pdf_id, set())
+
+
+def set_bookmark(reader_id: str, pdf_id: str, page: int, bookmarked: bool) -> bool:
+    page = max(1, int(page))
+    pages = bookmarks_by_reader.setdefault(reader_id, {}).setdefault(pdf_id, set())
+    if bookmarked:
+        pages.add(page)
+    else:
+        pages.discard(page)
+        if not pages:
+            bookmarks_by_reader.get(reader_id, {}).pop(pdf_id, None)
+    save_bookmarks_state()
+    return page in bookmarks_by_reader.get(reader_id, {}).get(pdf_id, set())
+
+
+def get_bookmarks(reader_id: str, limit: int = 20) -> List[dict]:
+    rows = csv_read_dicts(BOOKMARKS_CSV)
+    user_rows = [r for r in rows if r.get("reader_id") == reader_id and r.get("pdf_id") in pdfs_by_id]
+    user_rows.sort(key=lambda r: int(r.get("created_at", 0)), reverse=True)
+
+    bookmarks = []
+    for row in user_rows[:limit]:
+        pdf_data = dict(pdfs_by_id[row["pdf_id"]])
+        pdf_data["bookmark_page"] = row.get("page", "1")
+        bookmarks.append(pdf_data)
+    return bookmarks
+
+
 def sorted_pdfs() -> List[dict]:
     return sorted(
         pdfs_by_id.values(),
@@ -343,9 +412,11 @@ INDEX_HTML = """
     .section-title { font-size: 14px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; color: #666; margin: 24px 0 8px 4px; }
     .card { background: #fff; border-radius: 14px; padding: 14px; margin: 10px 0; box-shadow: 0 1px 4px rgba(0,0,0,.08); border: 1px solid transparent; }
     .card.accent { border-left: 4px solid #0066cc; border-radius: 10px 14px 14px 10px; }
+    .card.bookmark { border-left: 4px solid #d98b00; border-radius: 10px 14px 14px 10px; }
     .title { font-size: 18px; font-weight: 700; margin-bottom: 4px; }
     .meta { color: #555; font-size: 14px; display: flex; gap: 8px; align-items: center; }
     .badge { background: #e0f0ff; color: #0066cc; padding: 2px 6px; border-radius: 6px; font-size: 11px; font-weight: bold; }
+    .badge.bookmark { background: #fff1d6; color: #9b6200; }
     a { color: inherit; text-decoration: none; display: block; }
     .btn { display: inline-block; margin-top: 10px; background: #111; color: #fff; padding: 10px 12px; border-radius: 10px; }
     .topbar { display:flex; gap:10px; flex-wrap:wrap; align-items:center; justify-content:space-between; }
@@ -372,6 +443,22 @@ INDEX_HTML = """
             <div class="title">{{ pdf['title'] }}</div>
             <div class="meta">
               <span class="badge">Page {{ pdf['current_page'] }}</span>
+              {% if pdf['folder'] %}{{ pdf['folder'] }} / {% endif %}
+              {% if pdf['page_count'] %}{{ pdf['page_count'] }} pages{% endif %}
+            </div>
+          </a>
+        </div>
+      {% endfor %}
+    {% endif %}
+
+    {% if bookmarks and not q %}
+      <div class="section-title">Bookmarks</div>
+      {% for pdf in bookmarks %}
+        <div class="card bookmark">
+          <a href="{{ url_for('read_pdf_page', pdf_id=pdf['pdf_id'], page_num=pdf['bookmark_page']) }}">
+            <div class="title">{{ pdf['title'] }}</div>
+            <div class="meta">
+              <span class="badge bookmark">Page {{ pdf['bookmark_page'] }}</span>
               {% if pdf['folder'] %}{{ pdf['folder'] }} / {% endif %}
               {% if pdf['page_count'] %}{{ pdf['page_count'] }} pages{% endif %}
             </div>
@@ -415,8 +502,11 @@ READER_HTML = """
     .top { position: sticky; top: 0; z-index: 5; background: rgba(17,17,17,.95); padding: 10px 12px; display:flex; justify-content:space-between; align-items:center; gap:10px; border-bottom: 1px solid #2a2a2a; }
     .top a { color: #fff; text-decoration: none; }
     .meta { font-size: 14px; opacity: .9; }
-    .viewer { display: flex; justify-content: center; align-items: flex-start; padding: 8px; }
-    img { max-width: 100%; height: auto; display: block; background: #222; }
+    .viewer { display: flex; justify-content: center; align-items: flex-start; padding: 8px; min-height: calc(100vh - 150px); }
+    img { display: block; background: #222; user-select: none; -webkit-user-drag: none; }
+    body.fit-width img { max-width: 100%; height: auto; }
+    body.fit-height .viewer { align-items: center; }
+    body.fit-height img { width: auto; max-width: none; height: calc(100vh - 154px); max-height: calc(100vh - 154px); }
     .controls { position: fixed; left: 0; right: 0; bottom: 0; display: flex; justify-content: space-between; gap: 8px; padding: 10px; background: rgba(17,17,17,.95); border-top: 1px solid #2a2a2a; }
     .btn { flex: 1; text-align: center; padding: 14px 10px; background: #2a2a2a; border-radius: 12px; color: #fff; text-decoration: none; font-size: 18px; touch-action: manipulation; user-select: none; border: none; cursor: pointer; }
     .btn:active { background: #444; }
@@ -429,16 +519,27 @@ READER_HTML = """
     .fullscreen-btn { display: flex; align-items: center; justify-content: center; padding: 10px; background: #2a2a2a; border-radius: 10px; color: #fff; border: none; cursor: pointer; }
     .fullscreen-btn:active { background: #444; }
     .fullscreen-btn svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+    .fullscreen-btn.active { color: #ffd37a; }
     .exit-icon { display: none; }
   </style>
 </head>
-<body>
+<body class="fit-width">
   <div class="top">
     <div>
       <div><a href="{{ url_for('index') }}">← Library</a></div>
       <div class="meta">{{ title }} · Page <span id="pageLabel">{{ page }}</span>{% if page_count %} / {{ page_count }}{% endif %}</div>
     </div>
     <div class="right-actions">
+      <button id="bookmarkBtn" class="fullscreen-btn{% if bookmarked %} active{% endif %}" onclick="toggleBookmark()" title="Bookmark page" aria-label="Bookmark page" aria-pressed="{{ 'true' if bookmarked else 'false' }}">
+        <svg viewBox="0 0 24 24">
+          <path d="M19 21l-7-4-7 4V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/>
+        </svg>
+      </button>
+      <button id="fitBtn" class="fullscreen-btn" onclick="toggleFitMode()" title="Fit height" aria-label="Toggle fit height">
+        <svg viewBox="0 0 24 24">
+          <path d="M12 3v18M8 7l4-4 4 4M8 17l4 4 4-4M5 3h14M5 21h14"/>
+        </svg>
+      </button>
       <button class="fullscreen-btn" onclick="toggleFullscreen()" title="Toggle Fullscreen">
         <svg class="enter-icon" viewBox="0 0 24 24">
           <path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/>
@@ -455,20 +556,120 @@ READER_HTML = """
   </div>
 
   <div class="viewer">
-    <img id="pageImg" src="{{ image_url }}" alt="Page {{ page }}">
+    <img id="pageImg" src="{{ image_url }}" alt="Page {{ page }}" decoding="async">
   </div>
 
   <div class="spacer"></div>
 
   <div class="controls">
-    <a class="btn" href="{{ prev_url }}">Prev</a>
-    <a class="btn" href="{{ next_url }}">Next</a>
+    <a id="prevBtn" class="btn" href="{{ prev_url }}">Prev</a>
+    <a id="nextBtn" class="btn" href="{{ next_url }}">Next</a>
   </div>
 
 <script>
   const pdfId = "{{ pdf_id }}";
   let currentPage = {{ page }};
   const maxPage = {{ page_count or 999999 }};
+  const imageBaseUrl = "{{ image_base_url }}";
+  const readerBaseUrl = "{{ base_url }}";
+  let bookmarked = {{ 'true' if bookmarked else 'false' }};
+  const preloadedPages = new Map();
+
+  function clampPage(page) {
+    if (page < 1) return 1;
+    if (page > maxPage) return maxPage;
+    return page;
+  }
+
+  function imageUrl(page) {
+    return `${imageBaseUrl}${page}.jpg`;
+  }
+
+  function readerUrl(page) {
+    return `${readerBaseUrl}${page}`;
+  }
+
+  function preloadPage(page) {
+    page = clampPage(page);
+    if (page === currentPage || preloadedPages.has(page)) return;
+
+    const img = new Image();
+    img.decoding = "async";
+    img.src = imageUrl(page);
+    preloadedPages.set(page, img);
+  }
+
+  function preloadNextPage() {
+    if (currentPage < maxPage) preloadPage(currentPage + 1);
+  }
+
+  function updateNavLinks() {
+    document.getElementById("prevBtn").href = readerUrl(clampPage(currentPage - 1));
+    document.getElementById("nextBtn").href = readerUrl(clampPage(currentPage + 1));
+  }
+
+  function refreshBookmarkForPage(page) {
+    fetch(`/pdf/${pdfId}/bookmark?page=${page}`)
+      .then((r) => r.json())
+      .then((data) => applyBookmarkState(data.bookmarked))
+      .catch(() => applyBookmarkState(false));
+  }
+
+  function showPage(page, options = {}) {
+    page = clampPage(page);
+    if (page === currentPage && !options.force) return;
+
+    const pageImg = document.getElementById("pageImg");
+    const cachedImg = preloadedPages.get(page);
+    pageImg.src = cachedImg ? cachedImg.src : imageUrl(page);
+    pageImg.alt = `Page ${page}`;
+
+    currentPage = page;
+    document.getElementById("pageLabel").textContent = page;
+    document.getElementById("pageInput").value = page;
+    updateNavLinks();
+    saveProgress(page);
+    refreshBookmarkForPage(page);
+    preloadNextPage();
+
+    if (!options.replaceHistory) {
+      history.pushState({page}, "", readerUrl(page));
+    }
+  }
+
+  function applyFitMode(mode) {
+    const fitMode = mode === "height" ? "height" : "width";
+    document.body.classList.toggle("fit-height", fitMode === "height");
+    document.body.classList.toggle("fit-width", fitMode === "width");
+
+    const fitBtn = document.getElementById("fitBtn");
+    fitBtn.classList.toggle("active", fitMode === "height");
+    fitBtn.title = fitMode === "height" ? "Fit width" : "Fit height";
+    fitBtn.setAttribute("aria-label", fitBtn.title);
+    localStorage.setItem("pdfFitMode", fitMode);
+  }
+
+  function toggleFitMode() {
+    applyFitMode(document.body.classList.contains("fit-height") ? "width" : "height");
+  }
+
+  function applyBookmarkState(value) {
+    bookmarked = Boolean(value);
+    const bookmarkBtn = document.getElementById("bookmarkBtn");
+    bookmarkBtn.classList.toggle("active", bookmarked);
+    bookmarkBtn.setAttribute("aria-pressed", bookmarked ? "true" : "false");
+  }
+
+  function toggleBookmark() {
+    fetch(`/pdf/${pdfId}/bookmark`, {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({page: currentPage, bookmarked: !bookmarked})
+    })
+      .then((r) => r.json())
+      .then((data) => applyBookmarkState(data.bookmarked))
+      .catch(() => {});
+  }
 
   function toggleFullscreen() {
     if (!document.fullscreenElement) {
@@ -501,9 +702,7 @@ READER_HTML = """
   }
 
   function go(page) {
-    if (page < 1) page = 1;
-    if (page > maxPage) page = maxPage;
-    window.location.href = `{{ base_url }}` + page;
+    showPage(page);
   }
 
   function jumpToPage() {
@@ -516,22 +715,54 @@ READER_HTML = """
     if (e.key === "ArrowRight") go(currentPage + 1);
   });
 
+  document.getElementById("prevBtn").addEventListener("click", (e) => {
+    e.preventDefault();
+    go(currentPage - 1);
+  });
+
+  document.getElementById("nextBtn").addEventListener("click", (e) => {
+    e.preventDefault();
+    go(currentPage + 1);
+  });
+
+  window.addEventListener("popstate", (e) => {
+    if (e.state && e.state.page) {
+      showPage(e.state.page, {replaceHistory: true});
+      return;
+    }
+
+    const match = window.location.pathname.match(/\/page\/(\d+)$/);
+    if (match) showPage(parseInt(match[1], 10), {replaceHistory: true});
+  });
+
   let startX = null;
+  let startY = null;
   document.addEventListener("touchstart", (e) => {
-    if (e.touches && e.touches.length === 1) startX = e.touches[0].clientX;
+    if (e.target.closest(".top, .controls, button, input, a")) return;
+    if (e.touches && e.touches.length === 1) {
+      startX = e.touches[0].clientX;
+      startY = e.touches[0].clientY;
+    }
   }, {passive:true});
   document.addEventListener("touchend", (e) => {
-    if (startX === null) return;
+    if (startX === null || startY === null) return;
     const endX = e.changedTouches[0].clientX;
+    const endY = e.changedTouches[0].clientY;
     const dx = endX - startX;
-    if (Math.abs(dx) > 50) {
+    const dy = endY - startY;
+    if (Math.abs(dx) > 70 && Math.abs(dx) > Math.abs(dy) * 1.5) {
       if (dx < 0) go(currentPage + 1);
       else go(currentPage - 1);
     }
     startX = null;
+    startY = null;
   }, {passive:true});
 
   // Save progress when page loads.
+  applyFitMode(localStorage.getItem("pdfFitMode") || "width");
+  history.replaceState({page: currentPage}, "", readerUrl(currentPage));
+  updateNavLinks();
+  preloadNextPage();
   saveProgress(currentPage);
 </script>
 </body>
@@ -552,11 +783,13 @@ def index():
     
     # Fetch recent reads only when not searching to keep layout clean
     recents = get_recent_reads(reader_id, limit=5)
+    bookmarks = get_bookmarks(reader_id, limit=20)
     
     return render_template_string(
         INDEX_HTML,
         pdfs=items,
         recents=recents,
+        bookmarks=bookmarks,
         count=len(items),
         q=q,
         library_dir=str(LIBRARY_DIR),
@@ -581,8 +814,10 @@ def read_pdf(pdf_id: str):
     if count and start_page > count:
         start_page = count
 
-    base_url = url_for("pdf_page", pdf_id=pdf_id, page_num=1)
+    base_url = url_for("read_pdf_page", pdf_id=pdf_id, page_num=1)
     base_url = base_url.rsplit("/", 1)[0] + "/"
+    image_base_url = url_for("pdf_page", pdf_id=pdf_id, page_num=1)
+    image_base_url = image_base_url.rsplit("/", 1)[0] + "/"
 
     return render_template_string(
         READER_HTML,
@@ -591,9 +826,11 @@ def read_pdf(pdf_id: str):
         page=start_page,
         page_count=count,
         image_url=url_for("pdf_page", pdf_id=pdf_id, page_num=start_page),
+        image_base_url=image_base_url,
         prev_url=url_for("read_pdf_page", pdf_id=pdf_id, page_num=max(1, start_page - 1)),
         next_url=url_for("read_pdf_page", pdf_id=pdf_id, page_num=min(count, start_page + 1)) if count else url_for("read_pdf_page", pdf_id=pdf_id, page_num=start_page + 1),
         base_url=base_url,
+        bookmarked=is_bookmarked(reader_id, pdf_id, start_page),
     )
 
 
@@ -611,6 +848,8 @@ def read_pdf_page(pdf_id: str, page_num: int):
 
     base_url = url_for("read_pdf_page", pdf_id=pdf_id, page_num=1)
     base_url = base_url.rsplit("/", 1)[0] + "/"
+    image_base_url = url_for("pdf_page", pdf_id=pdf_id, page_num=1)
+    image_base_url = image_base_url.rsplit("/", 1)[0] + "/"
 
     return render_template_string(
         READER_HTML,
@@ -619,9 +858,11 @@ def read_pdf_page(pdf_id: str, page_num: int):
         page=page_num,
         page_count=count,
         image_url=url_for("pdf_page", pdf_id=pdf_id, page_num=page_num),
+        image_base_url=image_base_url,
         prev_url=url_for("read_pdf_page", pdf_id=pdf_id, page_num=max(1, page_num - 1)),
         next_url=url_for("read_pdf_page", pdf_id=pdf_id, page_num=min(count, page_num + 1)) if count else url_for("read_pdf_page", pdf_id=pdf_id, page_num=page_num + 1),
         base_url=base_url,
+        bookmarked=is_bookmarked(reader_id, pdf_id, page_num),
     )
 
 
@@ -652,6 +893,28 @@ def progress(pdf_id: str):
     page = int(data.get("page", 1))
     set_progress(reader_id, pdf_id, page)
     return jsonify({"ok": True, "page": page})
+
+
+@app.route("/pdf/<pdf_id>/bookmark", methods=["GET", "POST"])
+def bookmark(pdf_id: str):
+    count = ensure_page_count(pdf_id)
+    reader_id = get_reader_id()
+
+    if request.method == "GET":
+        page = int(request.args.get("page", get_progress(reader_id, pdf_id)))
+        page = max(1, min(page, count))
+        return jsonify({
+            "pdf_id": pdf_id,
+            "page": page,
+            "bookmarked": is_bookmarked(reader_id, pdf_id, page),
+        })
+
+    data = request.get_json(silent=True) or {}
+    page = int(data.get("page", get_progress(reader_id, pdf_id)))
+    page = max(1, min(page, count))
+    bookmarked = bool(data.get("bookmarked", True))
+    bookmarked = set_bookmark(reader_id, pdf_id, page, bookmarked)
+    return jsonify({"ok": True, "page": page, "bookmarked": bookmarked})
 
 
 @app.route("/admin/rebuild-cache/<pdf_id>")
