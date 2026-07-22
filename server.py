@@ -17,6 +17,7 @@ from flask import (
     Flask,
     abort,
     after_this_request,
+    g,
     jsonify,
     make_response,
     redirect,
@@ -40,6 +41,9 @@ BOOKMARKS_CSV = DATA_DIR / "bookmarks.csv"
 JPEG_QUALITY = 80
 RENDER_ZOOM = 1.8  # Higher = sharper, larger files
 COOKIE_NAME = "reader_id"
+COOKIE_REFRESH_NAME = "reader_id_refreshed_at"
+COOKIE_MAX_AGE = 60 * 60 * 24 * 365 * 5
+COOKIE_REFRESH_INTERVAL = 60 * 60 * 24 * 30
 
 app = Flask(__name__)
 
@@ -179,9 +183,10 @@ def save_bookmarks_state() -> None:
 
 
 def get_reader_id() -> str:
-    rid = request.cookies.get(COOKIE_NAME)
-    if not rid:
-        rid = uuid.uuid4().hex
+    rid = getattr(g, "reader_id", None)
+    if rid is None:
+        rid = request.cookies.get(COOKIE_NAME) or uuid.uuid4().hex
+        g.reader_id = rid
     return rid
 
 
@@ -383,12 +388,27 @@ scan_library()
 
 @app.after_request
 def set_reader_cookie(resp):
-    rid = request.cookies.get(COOKIE_NAME)
-    if not rid:
+    now = int(time.time())
+    try:
+        last_refresh = int(request.cookies.get(COOKIE_REFRESH_NAME, "0"))
+    except ValueError:
+        last_refresh = 0
+
+    cookie_missing = not request.cookies.get(COOKIE_NAME)
+    refresh_due = last_refresh <= 0 or now - last_refresh >= COOKIE_REFRESH_INTERVAL or last_refresh > now
+    if cookie_missing or refresh_due:
+        rid = get_reader_id()
         resp.set_cookie(
             COOKIE_NAME,
-            get_reader_id(),
-            max_age=60 * 60 * 24 * 365 * 5,
+            rid,
+            max_age=COOKIE_MAX_AGE,
+            httponly=True,
+            samesite="Lax",
+        )
+        resp.set_cookie(
+            COOKIE_REFRESH_NAME,
+            str(now),
+            max_age=COOKIE_MAX_AGE,
             httponly=True,
             samesite="Lax",
         )
@@ -404,6 +424,7 @@ INDEX_HTML = """
 <html>
 <head>
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%23111'/%3E%3Cpath d='M14 16c8-2 14 0 18 5v30c-4-5-10-7-18-5V16zm36 0c-8-2-14 0-18 5v30c4-5 10-7 18-5V16z' fill='%23fff'/%3E%3Cpath d='M32 21v30' stroke='%23d98b00' stroke-width='3'/%3E%3C/svg%3E">
   <title>PDF Library</title>
   <style>
     body { font-family: system-ui, sans-serif; margin: 0; background: #f4f4f4; color: #111; }
@@ -412,11 +433,17 @@ INDEX_HTML = """
     .section-title { font-size: 14px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; color: #666; margin: 24px 0 8px 4px; }
     .card { background: #fff; border-radius: 14px; padding: 14px; margin: 10px 0; box-shadow: 0 1px 4px rgba(0,0,0,.08); border: 1px solid transparent; }
     .card.accent { border-left: 4px solid #0066cc; border-radius: 10px 14px 14px 10px; }
-    .card.bookmark { border-left: 4px solid #d98b00; border-radius: 10px 14px 14px 10px; }
+    .card-row { display: flex; align-items: center; gap: 10px; }
+    .card-link { flex: 1; min-width: 0; }
+    .card-menu { position: relative; flex: none; }
+    .card-menu summary { display: flex; align-items: center; justify-content: center; width: 44px; height: 44px; border-radius: 10px; background: #eee; cursor: pointer; font-size: 24px; line-height: 1; list-style: none; user-select: none; }
+    .card-menu summary::-webkit-details-marker { display: none; }
+    .card-menu-panel { position: absolute; z-index: 2; top: calc(100% + 6px); right: 0; min-width: 170px; padding: 6px; background: #fff; border: 1px solid #ccc; border-radius: 10px; box-shadow: 0 8px 24px rgba(0,0,0,.18); }
+    .card-menu-panel a { padding: 10px 12px; border-radius: 7px; white-space: nowrap; }
+    .card-menu-panel a:active { background: #eee; }
     .title { font-size: 18px; font-weight: 700; margin-bottom: 4px; }
     .meta { color: #555; font-size: 14px; display: flex; gap: 8px; align-items: center; }
     .badge { background: #e0f0ff; color: #0066cc; padding: 2px 6px; border-radius: 6px; font-size: 11px; font-weight: bold; }
-    .badge.bookmark { background: #fff1d6; color: #9b6200; }
     a { color: inherit; text-decoration: none; display: block; }
     .btn { display: inline-block; margin-top: 10px; background: #111; color: #fff; padding: 10px 12px; border-radius: 10px; }
     .topbar { display:flex; gap:10px; flex-wrap:wrap; align-items:center; justify-content:space-between; }
@@ -438,8 +465,8 @@ INDEX_HTML = """
     {% if recents and not q %}
       <div class="section-title">Continue Reading</div>
       {% for pdf in recents %}
-        <div class="card accent">
-          <a href="{{ url_for('read_pdf', pdf_id=pdf['pdf_id']) }}">
+        <div class="card accent card-row">
+          <a class="card-link" href="{{ url_for('read_pdf', pdf_id=pdf['pdf_id']) }}">
             <div class="title">{{ pdf['title'] }}</div>
             <div class="meta">
               <span class="badge">Page {{ pdf['current_page'] }}</span>
@@ -447,22 +474,14 @@ INDEX_HTML = """
               {% if pdf['page_count'] %}{{ pdf['page_count'] }} pages{% endif %}
             </div>
           </a>
-        </div>
-      {% endfor %}
-    {% endif %}
-
-    {% if bookmarks and not q %}
-      <div class="section-title">Bookmarks</div>
-      {% for pdf in bookmarks %}
-        <div class="card bookmark">
-          <a href="{{ url_for('read_pdf_page', pdf_id=pdf['pdf_id'], page_num=pdf['bookmark_page']) }}">
-            <div class="title">{{ pdf['title'] }}</div>
-            <div class="meta">
-              <span class="badge bookmark">Page {{ pdf['bookmark_page'] }}</span>
-              {% if pdf['folder'] %}{{ pdf['folder'] }} / {% endif %}
-              {% if pdf['page_count'] %}{{ pdf['page_count'] }} pages{% endif %}
-            </div>
-          </a>
+          {% if pdf['pdf_id'] in bookmarked_pdf_ids %}
+            <details class="card-menu">
+              <summary aria-label="More options for {{ pdf['title'] }}" title="More options">⋯</summary>
+              <div class="card-menu-panel">
+                <a href="{{ url_for('pdf_bookmarks', pdf_id=pdf['pdf_id']) }}">View bookmarks</a>
+              </div>
+            </details>
+          {% endif %}
         </div>
       {% endfor %}
     {% endif %}
@@ -470,14 +489,22 @@ INDEX_HTML = """
     {# --- MAIN LIBRARY LIST SECTION --- #}
     <div class="section-title">{% if q %}Search Results{% else %}All Documents{% endif %}</div>
     {% for pdf in pdfs %}
-      <div class="card">
-        <a href="{{ url_for('read_pdf', pdf_id=pdf['pdf_id']) }}">
-          <div class="title">{{ pdf['title'] }}</div>
-          <div class="meta">
-            {% if pdf['folder'] %}{{ pdf['folder'] }} / {% endif %}
-            {% if pdf['page_count'] %}{{ pdf['page_count'] }} pages{% else %}page count unknown{% endif %}
-          </div>
-        </a>
+      <div class="card card-row">
+        <a class="card-link" href="{{ url_for('read_pdf', pdf_id=pdf['pdf_id']) }}">
+            <div class="title">{{ pdf['title'] }}</div>
+            <div class="meta">
+              {% if pdf['folder'] %}{{ pdf['folder'] }} / {% endif %}
+              {% if pdf['page_count'] %}{{ pdf['page_count'] }} pages{% else %}page count unknown{% endif %}
+            </div>
+          </a>
+        {% if pdf['pdf_id'] in bookmarked_pdf_ids %}
+          <details class="card-menu">
+            <summary aria-label="More options for {{ pdf['title'] }}" title="More options">⋯</summary>
+            <div class="card-menu-panel">
+              <a href="{{ url_for('pdf_bookmarks', pdf_id=pdf['pdf_id']) }}">View bookmarks</a>
+            </div>
+          </details>
+        {% endif %}
       </div>
     {% else %}
       <p>No PDFs found matching your query.</p>
@@ -491,16 +518,52 @@ INDEX_HTML = """
 </html>
 """
 
+PDF_BOOKMARKS_HTML = """
+<!doctype html>
+<html>
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%23111'/%3E%3Cpath d='M14 16c8-2 14 0 18 5v30c-4-5-10-7-18-5V16zm36 0c-8-2-14 0-18 5v30c4-5 10-7 18-5V16z' fill='%23fff'/%3E%3Cpath d='M32 21v30' stroke='%23d98b00' stroke-width='3'/%3E%3C/svg%3E">
+  <title>Bookmarks · {{ pdf['title'] }}</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 0; background: #f4f4f4; color: #111; }
+    header { padding: 16px; background: #111; color: #fff; }
+    .wrap { max-width: 900px; margin: 0 auto; padding: 12px; }
+    a { color: inherit; text-decoration: none; }
+    .back { display: inline-flex; align-items: center; min-height: 44px; padding: 0 14px; border-radius: 10px; background: #2a2a2a; font-weight: 700; }
+    .card { display: block; background: #fff; border-left: 4px solid #d98b00; border-radius: 10px 14px 14px 10px; padding: 14px; margin: 10px 0; box-shadow: 0 1px 4px rgba(0,0,0,.08); }
+    .title { font-size: 20px; font-weight: 700; margin: 16px 0; }
+    .badge { display: inline-block; background: #fff1d6; color: #9b6200; padding: 4px 8px; border-radius: 6px; font-size: 13px; font-weight: 700; }
+  </style>
+</head>
+<body>
+  <header><div class="wrap"><a class="back" href="{{ url_for('index') }}">← Library</a></div></header>
+  <main class="wrap">
+    <div class="title">Bookmarks · {{ pdf['title'] }}</div>
+    {% for page in pages %}
+      <a class="card" href="{{ url_for('read_pdf_page', pdf_id=pdf['pdf_id'], page_num=page) }}">
+        <span class="badge">Page {{ page }}</span>
+      </a>
+    {% else %}
+      <p>No bookmarks for this PDF.</p>
+    {% endfor %}
+  </main>
+</body>
+</html>
+"""
+
 READER_HTML = """
 <!doctype html>
 <html>
 <head>
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=3">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%23111'/%3E%3Cpath d='M14 16c8-2 14 0 18 5v30c-4-5-10-7-18-5V16zm36 0c-8-2-14 0-18 5v30c4-5 10-7 18-5V16z' fill='%23fff'/%3E%3Cpath d='M32 21v30' stroke='%23d98b00' stroke-width='3'/%3E%3C/svg%3E">
   <title>{{ title }}</title>
   <style>
     html, body { margin: 0; padding: 0; height: 100%; background: #111; color: #fff; font-family: system-ui, sans-serif; }
     .top { position: sticky; top: 0; z-index: 5; background: rgba(17,17,17,.95); padding: 10px 12px; display:flex; justify-content:space-between; align-items:center; gap:10px; border-bottom: 1px solid #2a2a2a; }
     .top a { color: #fff; text-decoration: none; }
+    .library-btn { display: inline-flex; align-items: center; min-height: 44px; padding: 0 16px; margin-bottom: 4px; background: #2a2a2a; border-radius: 12px; font-size: 18px; font-weight: 700; }
     .meta { font-size: 14px; opacity: .9; }
     .viewer { display: flex; justify-content: center; align-items: flex-start; padding: 8px; min-height: calc(100vh - 150px); }
     img { display: block; background: #222; user-select: none; -webkit-user-drag: none; }
@@ -526,7 +589,7 @@ READER_HTML = """
 <body class="fit-width">
   <div class="top">
     <div>
-      <div><a href="{{ url_for('index') }}">← Library</a></div>
+      <div><a class="library-btn" href="{{ url_for('index') }}">← Library</a></div>
       <div class="meta">{{ title }} · Page <span id="pageLabel">{{ page }}</span>{% if page_count %} / {{ page_count }}{% endif %}</div>
     </div>
     <div class="right-actions">
@@ -632,7 +695,7 @@ READER_HTML = """
     refreshBookmarkForPage(page);
     preloadNextPage();
 
-    if (!options.replaceHistory) {
+    if (!options.replaceHistory && !document.fullscreenElement) {
       history.pushState({page}, "", readerUrl(page));
     }
   }
@@ -690,6 +753,7 @@ READER_HTML = """
     } else {
       enterIcon.style.display = 'block';
       exitIcon.style.display = 'none';
+      history.replaceState({page: currentPage}, "", readerUrl(currentPage));
     }
   });
 
@@ -735,29 +799,6 @@ READER_HTML = """
     if (match) showPage(parseInt(match[1], 10), {replaceHistory: true});
   });
 
-  let startX = null;
-  let startY = null;
-  document.addEventListener("touchstart", (e) => {
-    if (e.target.closest(".top, .controls, button, input, a")) return;
-    if (e.touches && e.touches.length === 1) {
-      startX = e.touches[0].clientX;
-      startY = e.touches[0].clientY;
-    }
-  }, {passive:true});
-  document.addEventListener("touchend", (e) => {
-    if (startX === null || startY === null) return;
-    const endX = e.changedTouches[0].clientX;
-    const endY = e.changedTouches[0].clientY;
-    const dx = endX - startX;
-    const dy = endY - startY;
-    if (Math.abs(dx) > 70 && Math.abs(dx) > Math.abs(dy) * 1.5) {
-      if (dx < 0) go(currentPage + 1);
-      else go(currentPage - 1);
-    }
-    startX = null;
-    startY = null;
-  }, {passive:true});
-
   // Save progress when page loads.
   applyFitMode(localStorage.getItem("pdfFitMode") || "width");
   history.replaceState({page: currentPage}, "", readerUrl(currentPage));
@@ -783,17 +824,25 @@ def index():
     
     # Fetch recent reads only when not searching to keep layout clean
     recents = get_recent_reads(reader_id, limit=5)
-    bookmarks = get_bookmarks(reader_id, limit=20)
+    bookmarked_pdf_ids = set(bookmarks_by_reader.get(reader_id, {}))
     
     return render_template_string(
         INDEX_HTML,
         pdfs=items,
         recents=recents,
-        bookmarks=bookmarks,
+        bookmarked_pdf_ids=bookmarked_pdf_ids,
         count=len(items),
         q=q,
         library_dir=str(LIBRARY_DIR),
     )
+
+
+@app.route("/bookmarks/<pdf_id>")
+def pdf_bookmarks(pdf_id: str):
+    pdf = get_pdf(pdf_id)
+    reader_id = get_reader_id()
+    pages = sorted(bookmarks_by_reader.get(reader_id, {}).get(pdf_id, set()))
+    return render_template_string(PDF_BOOKMARKS_HTML, pdf=pdf, pages=pages)
 
 
 @app.route("/rescan")

@@ -8,7 +8,7 @@ A lightweight, self-hosted, tablet-friendly web application for reading and mana
 - **Optimized Rendering:** Converts PDF pages to crisp JPEG formats on demand using `PyMuPDF` to prevent heavy PDF downloads on mobile devices.
 - **Smart Progress Tracking:** Remembers your exact position across multiple documents without requiring user accounts or logins.
 - **"Continue Reading" Section:** Highlights your top 5 most recently read documents right at the top of the homepage for seamless return access.
-- **Immersive Viewports:** Built-in hardware-accelerated swipe gestures for mobile tablets, arrow key hotkeys, and a responsive SVG-driven Fullscreen mode toggle.
+- **Immersive Viewports:** Touch-friendly page controls, arrow key hotkeys, and a responsive SVG-driven Fullscreen mode toggle.
 
 ## Setup & Installation
 
