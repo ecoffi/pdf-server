@@ -128,7 +128,7 @@ def save_pdfs_state() -> None:
     )
 
 
-def save_progress_state() -> None:
+def save_progress_state(updated: Optional[tuple] = None) -> None:
     # Read the full raw data to preserve other readers' historical progress logs during single-user updates
     existing_rows = csv_read_dicts(PROGRESS_CSV)
     
@@ -137,20 +137,32 @@ def save_progress_state() -> None:
     for row in existing_rows:
         state_map[(row["reader_id"], row["pdf_id"])] = row
 
-    # Overwrite/insert with fresh in-memory live tracking updates
+    # Overwrite/insert with fresh in-memory live tracking updates.
+    # Only bump last_read for the document that just changed; otherwise every
+    # save would give all in-progress PDFs the same timestamp and Continue
+    # Reading could no longer sort by recency.
+    now = str(int(time.time()))
     for rid, pdf_map in progress_by_reader.items():
         for pid, page in pdf_map.items():
-            state_map[(rid, pid)] = {
+            key = (rid, pid)
+            existing = state_map.get(key, {})
+            if updated == key or not existing.get("last_read"):
+                last_read = now
+            else:
+                last_read = existing["last_read"]
+            state_map[key] = {
                 "reader_id": rid,
                 "pdf_id": pid,
                 "current_page": str(page),
-                "last_read": str(int(time.time())),
+                "last_read": last_read,
             }
-            
+
+    rows = list(state_map.values())
+    rows.sort(key=lambda r: int(r.get("last_read") or 0), reverse=True)
     csv_write_dicts_atomic(
         PROGRESS_CSV,
         ["reader_id", "pdf_id", "current_page", "last_read"],
-        list(state_map.values()),
+        rows,
     )
 
 
@@ -312,7 +324,7 @@ def get_progress(reader_id: str, pdf_id: str) -> int:
 
 def set_progress(reader_id: str, pdf_id: str, page: int) -> None:
     progress_by_reader.setdefault(reader_id, {})[pdf_id] = max(1, int(page))
-    save_progress_state()
+    save_progress_state(updated=(reader_id, pdf_id))
 
 
 def is_bookmarked(reader_id: str, pdf_id: str, page: int) -> bool:
